@@ -2373,6 +2373,33 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     bool use_batched_cublas_bf16 = src0->type == GGML_TYPE_BF16 && bf16_mma_hardware_available(cc);
     bool use_batched_cublas_f32  = src0->type == GGML_TYPE_F32;
 
+#if defined(GGML_USE_HIP)
+    // Workaround for rocBLAS bug: in heterogeneous multi-GPU configurations (e.g. gfx1201 + gfx1101),
+    // rocBLAS's Tensile solution cache is process-global and keyed by problem signature without
+    // GPU architecture. When the same GEMM problem runs on different architectures, the cache
+    // returns the wrong .hsaco binary, causing "no kernel image is available for execution on
+    // the device". Only affects F32 src1 ops (which can have batch dims ne[2]*ne[3] > 1).
+    // Non-F32 src1 is guaranteed ne[2]==ne[3]==1, so cuBLAS is safe for those.
+    bool hip_heterogeneous = false;
+    {
+        const int n_devices = ggml_backend_cuda_get_device_count();
+        if (n_devices > 1) {
+            const int cc0 = ggml_cuda_info().devices[0].cc;
+            for (int id = 1; id < n_devices; ++id) {
+                if (ggml_cuda_info().devices[id].cc != cc0) {
+                    hip_heterogeneous = true;
+                    break;
+                }
+            }
+            if (hip_heterogeneous && src1->type == GGML_TYPE_F32) {
+                use_batched_cublas_f16  = false;
+                use_batched_cublas_bf16 = false;
+                use_batched_cublas_f32  = false;
+            }
+        }
+    }
+#endif
+
     if (!split && use_mul_mat_vec_f) {
         // the custom F16 vector kernel can be used over batched cuBLAS GEMM
         // but this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
@@ -2394,7 +2421,18 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     } else if (use_mul_mat_q) {
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_q, quantize_mmq_q8_1_cuda);
     } else {
-        ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
+#if defined(GGML_USE_HIP)
+        // For heterogeneous multi-GPU with F32 src1: use custom vec_f kernels instead of
+        // cuBLAS/rocBLAS to avoid Tensile solution cache corruption. Slower but correct.
+        // Only F32 src1 can have batch dims > 1 (the assertion above guarantees this).
+        if (hip_heterogeneous && src1->type == GGML_TYPE_F32 &&
+                (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F32)) {
+            ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_f, nullptr);
+        } else
+#endif
+        {
+            ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
+        }
     }
 }
 

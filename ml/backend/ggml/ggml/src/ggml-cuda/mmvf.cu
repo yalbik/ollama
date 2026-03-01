@@ -690,27 +690,40 @@ void ggml_cuda_op_mul_mat_vec_f(
     const int64_t stride_sample_dst  = 0;
 
     ggml_cuda_mm_fusion_args_device empty{};
-    switch (src0->type) {
-        case GGML_TYPE_F32: {
-            const float * src0_d = (const float *) src0_dd_i;
-            mul_mat_vec_f_cuda(src0_d, src1_ddf_i, nullptr, empty, dst_dd_i, ne00, row_diff, src1_ncols, stride_row, stride_col_y, stride_col_dst,
-                nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, prec, stream);
-        } break;
-        case GGML_TYPE_F16: {
-            const half * src0_d = (const half *) src0_dd_i;
-            mul_mat_vec_f_cuda(src0_d, src1_ddf_i, nullptr, empty, dst_dd_i, ne00, row_diff, src1_ncols, stride_row, stride_col_y, stride_col_dst,
-                nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, prec, stream);
-        } break;
-        case GGML_TYPE_BF16: {
-            const nv_bfloat16 * src0_d = (const nv_bfloat16 *) src0_dd_i;
-            mul_mat_vec_f_cuda(src0_d, src1_ddf_i, nullptr, empty, dst_dd_i, ne00, row_diff, src1_ncols, stride_row, stride_col_y, stride_col_dst,
-                nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, prec, stream);
-        } break;
-        default:
-            GGML_ABORT("unsupported type: %s", ggml_type_name(src0->type));
+
+    // The mul_mat_vec_f kernel template only supports ncols_dst up to 8.
+    // When src1_ncols > 8 (e.g. delta-net F32xF32 ops with large batch dims),
+    // we chunk the work into batches of at most 8 columns. Each column is
+    // independent so this is mathematically equivalent.
+    constexpr int64_t MMVF_MAX_NCOLS = 8;
+
+    for (int64_t col0 = 0; col0 < src1_ncols; col0 += MMVF_MAX_NCOLS) {
+        const int64_t chunk_ncols = std::min(src1_ncols - col0, MMVF_MAX_NCOLS);
+        const float * src1_chunk = src1_ddf_i + col0 * stride_col_y;
+        float       * dst_chunk  = dst_dd_i   + col0 * stride_col_dst;
+
+        switch (src0->type) {
+            case GGML_TYPE_F32: {
+                const float * src0_d = (const float *) src0_dd_i;
+                mul_mat_vec_f_cuda(src0_d, src1_chunk, nullptr, empty, dst_chunk, ne00, row_diff, chunk_ncols, stride_row, stride_col_y, stride_col_dst,
+                    nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, prec, stream);
+            } break;
+            case GGML_TYPE_F16: {
+                const half * src0_d = (const half *) src0_dd_i;
+                mul_mat_vec_f_cuda(src0_d, src1_chunk, nullptr, empty, dst_chunk, ne00, row_diff, chunk_ncols, stride_row, stride_col_y, stride_col_dst,
+                    nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, prec, stream);
+            } break;
+            case GGML_TYPE_BF16: {
+                const nv_bfloat16 * src0_d = (const nv_bfloat16 *) src0_dd_i;
+                mul_mat_vec_f_cuda(src0_d, src1_chunk, nullptr, empty, dst_chunk, ne00, row_diff, chunk_ncols, stride_row, stride_col_y, stride_col_dst,
+                    nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                    nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, prec, stream);
+            } break;
+            default:
+                GGML_ABORT("unsupported type: %s", ggml_type_name(src0->type));
+        }
     }
 
     GGML_UNUSED_VARS(ctx, src1, dst, src1_ddq_i, src1_ncols, src1_padded_row_size);
