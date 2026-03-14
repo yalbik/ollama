@@ -2374,12 +2374,18 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     bool use_batched_cublas_f32  = src0->type == GGML_TYPE_F32;
 
 #if defined(GGML_USE_HIP)
-    // Workaround for rocBLAS bug: in heterogeneous multi-GPU configurations (e.g. gfx1201 + gfx1101),
-    // rocBLAS's Tensile solution cache is process-global and keyed by problem signature without
-    // GPU architecture. When the same GEMM problem runs on different architectures, the cache
-    // returns the wrong .hsaco binary, causing "no kernel image is available for execution on
-    // the device". Only affects F32 src1 ops (which can have batch dims ne[2]*ne[3] > 1).
-    // Non-F32 src1 is guaranteed ne[2]==ne[3]==1, so cuBLAS is safe for those.
+    // Workaround for rocBLAS Tensile cache bug in heterogeneous multi-GPU (e.g. gfx1201 + gfx1101):
+    // The Tensile solution cache is process-global, keyed by GEMM problem signature (M,N,K,types)
+    // WITHOUT GPU architecture. When two GPUs with different ISAs execute an identical GEMM problem,
+    // the cache returns the wrong .hsaco binary → "no kernel image is available for execution".
+    //
+    // This specifically affects the BATCHED cuBLAS path (cublasGemmBatchedEx / cublasGemmStridedBatchedEx)
+    // because it operates on non-split tensors where both GPUs see identical matrix dimensions across
+    // different layers. Disable it for F32 src1 (which can have batch dims ne[2]*ne[3] > 1).
+    //
+    // The non-batched fallback (ggml_cuda_op_mul_mat_cublas via ggml_cuda_op_mul_mat) is SAFE because
+    // split tensors give each GPU a different row range → different M dimension → different cache keys.
+    // Non-F32 src1 is guaranteed ne[2]==ne[3]==1, so cuBLAS is safe for those regardless.
     bool hip_heterogeneous = false;
     {
         const int n_devices = ggml_backend_cuda_get_device_count();
@@ -2421,18 +2427,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     } else if (use_mul_mat_q) {
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_q, quantize_mmq_q8_1_cuda);
     } else {
-#if defined(GGML_USE_HIP)
-        // For heterogeneous multi-GPU with F32 src1: use custom vec_f kernels instead of
-        // cuBLAS/rocBLAS to avoid Tensile solution cache corruption. Slower but correct.
-        // Only F32 src1 can have batch dims > 1 (the assertion above guarantees this).
-        if (hip_heterogeneous && src1->type == GGML_TYPE_F32 &&
-                (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F32)) {
-            ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_vec_f, nullptr);
-        } else
-#endif
-        {
-            ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
-        }
+        // This fallback handles float-type src0 on split buffers (or non-split when no other
+        // path matched). It uses ggml_cuda_op_mul_mat which dispatches per-GPU with different
+        // row ranges, so each GPU sees a different M dimension in cublasGemmEx. This makes
+        // Tensile cache keys differ per GPU, avoiding the heterogeneous .hsaco collision.
+        // (The dangerous BATCHED cuBLAS path — which uses identical M,N,K across GPUs — is
+        // already disabled above for heterogeneous configs.)
+        ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
     }
 }
 

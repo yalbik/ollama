@@ -12,6 +12,7 @@ build
 test_data
 *.crt
 __debug_bin*
+prefill-bench-*.txt
 llama/build
 llama/vendor
 /ollama
