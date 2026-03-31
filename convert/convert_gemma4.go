@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"github.com/ollama/ollama/fs/ggml"
+	"github.com/pdevine/tensor"
+	"github.com/pdevine/tensor/native"
 )
 
 type gemma4Model struct {
@@ -32,7 +34,7 @@ type gemma4Model struct {
 		EnableMoeBlock          bool     `json:"enable_moe_block"`
 		NumExperts              *uint32  `json:"num_experts"`
 		TopKExperts             *uint32  `json:"top_k_experts"`
-		ExpertIntermediateSize  *uint32  `json:"moe_intermediate_size"`
+		ExpertIntermediateSize  *uint32  `json:"expert_intermediate_size"`
 		HiddenSizePerLayerInput *uint32  `json:"hidden_size_per_layer_input"`
 		NumKVSharedLayers       uint32   `json:"num_kv_shared_layers"`
 		AttentionKEqV           bool     `json:"attention_k_eq_v"`
@@ -55,15 +57,6 @@ type gemma4Model struct {
 		PoolingKernelSize uint32  `json:"pooling_kernel_size"`
 		LayerNormEps      float32 `json:"layer_norm_eps"`
 	} `json:"vision_config"`
-
-	AudioModel *struct {
-		HiddenSize        uint32  `json:"hidden_size"`
-		OutputProjDims    uint32  `json:"output_proj_dims"`
-		NumHiddenLayers   uint32  `json:"num_hidden_layers"`
-		NumAttentionHeads uint32  `json:"num_attention_heads"`
-		ConvKernelSize    uint32  `json:"conv_kernel_size"`
-		RMSNormEps        float32 `json:"rms_norm_eps"`
-	} `json:"audio_config"`
 }
 
 func (p *gemma4Model) KV(t *Tokenizer) KV {
@@ -186,23 +179,6 @@ func (p *gemma4Model) KV(t *Tokenizer) KV {
 		kv["gemma4.vision.attention.layer_norm_epsilon"] = eps
 	}
 
-	// Audio model KV metadata
-	if p.AudioModel != nil && p.AudioModel.NumHiddenLayers > 0 {
-		ac := p.AudioModel
-		kv["gemma4.audio.block_count"] = ac.NumHiddenLayers
-		kv["gemma4.audio.embedding_length"] = ac.HiddenSize
-		kv["gemma4.audio.feed_forward_length"] = ac.HiddenSize * 4
-		kv["gemma4.audio.attention.head_count"] = ac.NumAttentionHeads
-		eps := ac.RMSNormEps
-		if eps == 0 {
-			eps = 1e-6
-		}
-		kv["gemma4.audio.attention.layer_norm_epsilon"] = eps
-		if ac.ConvKernelSize > 0 {
-			kv["gemma4.audio.conv_kernel_size"] = ac.ConvKernelSize
-		}
-	}
-
 	return kv
 }
 
@@ -230,8 +206,19 @@ func (p *gemma4Model) Tensors(ts []Tensor) []*ggml.Tensor {
 	for _, t := range ts {
 		name := t.Name()
 
+		// Skip audio tensors (vision is now handled)
+		if strings.Contains(name, "audio_tower") || strings.Contains(name, "embed_audio") {
+			continue
+		}
+
 		// Skip embedding_post_projection_norm — used as weightless RMS norm in inference
 		if strings.Contains(name, "embedding_post_projection_norm") {
+			continue
+		}
+
+		// Skip clippable linear clamp scalars — packed into v.clamp_data below
+		if strings.Contains(name, "input_min") || strings.Contains(name, "input_max") ||
+			strings.Contains(name, "output_min") || strings.Contains(name, "output_max") {
 			continue
 		}
 
@@ -245,8 +232,20 @@ func (p *gemma4Model) Tensors(ts []Tensor) []*ggml.Tensor {
 			name = strings.Replace(name, ".layer_output_scale.", ".out_scale.", 1)
 		}
 
-		// per_dim_scale: apply softplus to weight data and add .weight suffix.
-		if strings.HasPrefix(name, "a.blk.") && strings.HasSuffix(name, "per_dim_scale") {
+		// Audio tensor post-processing: block-level norm rename and per_dim_scale softplus.
+		if strings.HasPrefix(name, "a.blk.") {
+			// Conformer block final norm: a.blk.N.norm.weight → a.blk.N.layer_pre_norm.weight
+			if dotIdx := strings.Index(name[6:], "."); dotIdx >= 0 {
+				rest := name[6+dotIdx+1:]
+				if strings.HasPrefix(rest, "norm.") {
+					name = name[:6+dotIdx+1] + "layer_pre_norm." + rest[5:]
+				}
+			}
+		}
+
+		// per_dim_scale / per_dim_k_scale: apply softplus to weight data and add .weight suffix.
+		if strings.HasPrefix(name, "a.blk.") &&
+			(strings.HasSuffix(name, "per_dim_scale") || strings.HasSuffix(name, "per_dim_k_scale")) {
 			name = name + ".weight"
 			t.SetRepacker(softplusRepacker)
 		}
@@ -263,25 +262,33 @@ func (p *gemma4Model) Tensors(ts []Tensor) []*ggml.Tensor {
 			shape = []uint64{1}
 		}
 
-		// Depthwise conv1d shape: safetensors [C, 1, K] → GGUF ne[K, C].
-		// Shape array here maps to GGUF ne[] directly, but safetensors reader
-		// stores shape in PyTorch order [C, 1, K] which the GGUF writer inverts.
-		// Published GGUF has ne[0]=K, ne[1]=C → shape array must be [K, C].
-		if strings.HasPrefix(name, "a.blk.") && strings.Contains(name, "conv_dw") && strings.HasSuffix(name, ".weight") && len(shape) == 3 {
-			shape = []uint64{shape[0], shape[2]}
+		// Fused MoE gate_up_proj: split [experts, 2*intermediate, hidden] into separate gate and up.
+		// No transpose needed — the split shape [experts, intermediate, hidden] already matches
+		// the GGUF layout after the framework's dimension reversal (ne[0]=hidden matches input).
+		if strings.Contains(name, "moe.gate_up_proj") && len(shape) == 3 {
+			halfDim := int(shape[1]) / 2
+			newShape := slices.Clone(shape)
+			newShape[1] = newShape[1] / 2
+			for i, ggufName := range []string{"ffn_gate_exps.weight", "ffn_up_exps.weight"} {
+				tt := t.Clone()
+				tt.SetRepacker(p.sliceExperts(tensor.S(i*halfDim, (i+1)*halfDim)))
+				out = append(out, &ggml.Tensor{
+					Name:     strings.ReplaceAll(name, "moe.gate_up_proj", ggufName),
+					Kind:     tt.Kind(),
+					Shape:    slices.Clone(newShape),
+					WriterTo: tt,
+				})
+			}
+			continue
 		}
 
 		// MoE expert weights: no transpose needed. Safetensors stores [experts, out, in]
 		// which the framework reverses to GGUF ne=[in, out, experts], matching ggml_mul_mat_id.
 		// (transposeExperts was incorrectly swapping dims — removed)
 
-		// Audio conv weights are forced to F32 via tensorBase.Kind() in reader.go
-		// (im2col doesn't support BF16). No kindOverride needed — the Kind() method
-		// controls both the GGUF header type AND the WriteTo data encoding path.
-		var kindOverride *uint32
-
 		// Vision patch embedding: reshape from [n_embd, ksize_sq_c] to [n_embd, 3, patch_size, patch_size]
 		// Must be stored as F16 (not BF16) because the Conv2D im2col kernel requires F16/F32.
+		var kindOverride *uint32
 		if strings.Contains(name, "v.patch_embd.weight") && len(shape) == 2 {
 			nEmbd := shape[0]
 			patchSize := uint64(p.VisionModel.PatchSize)
@@ -439,74 +446,34 @@ func squeezeMiddleDim(_ string, data []float32, _ []uint64) ([]float32, error) {
 	return data, nil
 }
 
+// sliceExperts returns a repacker that slices dim 1 of a 3D expert tensor.
+// Used for splitting fused gate_up_proj into separate gate and up tensors.
+func (*gemma4Model) sliceExperts(dim1Slice tensor.Slice) Repacker {
+	return func(_ string, data []float32, shape []uint64) ([]float32, error) {
+		dims := make([]int, len(shape))
+		for i, d := range shape {
+			dims[i] = int(d)
+		}
+
+		var t tensor.Tensor = tensor.New(tensor.WithShape(dims...), tensor.WithBacking(data))
+		t, err := t.Slice(nil, dim1Slice)
+		if err != nil {
+			return nil, err
+		}
+
+		t = tensor.Materialize(t)
+		if err := t.Reshape(t.Shape().TotalSize()); err != nil {
+			return nil, err
+		}
+
+		return native.VectorF32(t.(*tensor.Dense))
+	}
+}
+
 func (p *gemma4Model) Replacements() []string {
 	return []string{
-		// ClippableLinear wraps nn.Linear — strip .linear. from weight path
+		// Vision ClippableLinear wraps nn.Linear — strip .linear. from weight path
 		".linear.weight", ".weight",
-		".linear.bias", ".bias",
-
-		// Audio SSCP (Sub-Sample Convolution Projection)
-		"model.audio_tower.subsample_conv_projection.conv_0.conv", "a.conv1d.0",
-		"model.audio_tower.subsample_conv_projection.conv_0.norm", "a.conv1d.0.norm",
-		"model.audio_tower.subsample_conv_projection.conv_1.conv", "a.conv1d.1",
-		"model.audio_tower.subsample_conv_projection.conv_1.norm", "a.conv1d.1.norm",
-		"model.audio_tower.subsample_conv_projection.layer0.conv", "a.conv1d.0",
-		"model.audio_tower.subsample_conv_projection.layer0.norm", "a.conv1d.0.norm",
-		"model.audio_tower.subsample_conv_projection.layer1.conv", "a.conv1d.1",
-		"model.audio_tower.subsample_conv_projection.layer1.norm", "a.conv1d.1.norm",
-		"model.audio_tower.subsample_conv_projection.input_proj_linear", "a.pre_encode.out",
-
-		// Audio conformer blocks
-		"model.audio_tower.conformer", "a.blk",
-		"model.audio_tower.layers", "a.blk",
-
-		// Audio conformer attention
-		"attention.attn.relative_position_embedding.pos_proj", "linear_pos",
-		"self_attn.relative_k_proj", "linear_pos",
-		"attention.attn.per_dim_key_scale", "per_dim_k_scale",
-		"attention.attn.per_dim_scale", "per_dim_scale",
-		"self_attn.per_dim_scale", "per_dim_scale",
-		"attention.attn.q_proj", "attn_q",
-		"attention.attn.k_proj", "attn_k",
-		"attention.attn.v_proj", "attn_v",
-		"attention.pre_attn_norm", "ln1",
-		"attention.post_norm", "ln2",
-		"attention.post", "attn_out",
-		"self_attn.post", "attn_out",
-		"norm_pre_attn", "ln1",
-		"norm_post_attn", "ln2",
-
-		// Audio conformer feedforward
-		"ffw_layer_start.pre_layer_norm", "ffn_norm",
-		"ffw_layer_start.post_layer_norm", "ffn_post_norm",
-		"ffw_layer_start.ffw_layer_1", "ffn_up",
-		"ffw_layer_start.ffw_layer_2", "ffn_down",
-		"ffw_layer_end.pre_layer_norm", "ffn_norm_1",
-		"ffw_layer_end.post_layer_norm", "ffn_post_norm_1",
-		"ffw_layer_end.ffw_layer_1", "ffn_up_1",
-		"ffw_layer_end.ffw_layer_2", "ffn_down_1",
-		"feed_forward1.pre_layer_norm", "ffn_norm",
-		"feed_forward1.post_layer_norm", "ffn_post_norm",
-		"feed_forward1.ffw_layer_1", "ffn_up",
-		"feed_forward1.ffw_layer_2", "ffn_down",
-		"feed_forward2.pre_layer_norm", "ffn_norm_1",
-		"feed_forward2.post_layer_norm", "ffn_post_norm_1",
-		"feed_forward2.ffw_layer_1", "ffn_up_1",
-		"feed_forward2.ffw_layer_2", "ffn_down_1",
-
-		// Audio conformer lightweight conv1d
-		"lconv1d.depthwise_conv1d", "conv_dw",
-		"lconv1d.pre_layer_norm", "conv_norm",
-		"lconv1d.conv_norm", "norm_conv",
-		"lconv1d.linear_start", "conv_pw1",
-		"lconv1d.linear_end", "conv_pw2",
-
-		// Audio block final norm
-		"norm_out", "layer_pre_norm",
-
-		// Audio embedder and output projection
-		"model.embed_audio.embedding_projection", "mm.a.input_projection",
-		"model.audio_tower.output_proj", "mm.a.fc",
 
 		// Vision encoder
 		"model.vision_tower.encoder.layers", "v.blk",
@@ -554,18 +521,9 @@ func (p *gemma4Model) Replacements() []string {
 		// MoE
 		"router.proj", "ffn_gate_inp",
 		"router.scale", "ffn_gate_inp.scale",
-		"router.per_expert_scale.weight", "ffn_down_exps.scale",
-		"router.per_expert_scale", "ffn_down_exps.scale",
-		"experts.gate_up_proj.weight", "ffn_gate_up_exps.weight",
-		"experts.gate_up_proj", "ffn_gate_up_exps.weight",
-		"experts.down_proj.weight", "ffn_down_exps.weight",
-		"experts.down_proj", "ffn_down_exps.weight",
 		"moe.gate_proj", "ffn_gate_exps.weight",
 		"moe.up_proj", "ffn_up_exps.weight",
-		"moe.gate_up_proj.weight", "ffn_gate_up_exps.weight",
-		"moe.gate_up_proj", "ffn_gate_up_exps.weight",
 		"moe.down_proj", "ffn_down_exps.weight",
-		"moe.per_expert_scale.weight", "ffn_down_exps.scale",
 		"moe.per_expert_scale", "ffn_down_exps.scale",
 
 		// Layer scalar

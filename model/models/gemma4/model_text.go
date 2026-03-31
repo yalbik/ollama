@@ -317,6 +317,7 @@ func (mlp *TextMLP) Forward(ctx ml.Context, hiddenState ml.Tensor) ml.Tensor {
 }
 
 // TextRouter implements the Gemma 4 MoE router.
+// It does: RMSNorm(no weight) → scale(1/sqrt(hidden)) → multiply by scale param → linear → softmax → topk
 type TextRouter struct {
 	Proj  *nn.Linear `gguf:"ffn_gate_inp"`
 	Scale ml.Tensor  `gguf:"ffn_gate_inp.scale"`
@@ -340,11 +341,9 @@ func (r *TextRouter) Forward(ctx ml.Context, hiddenState ml.Tensor, opts *TextOp
 
 // TextMoEBlock implements the Gemma 4 sparse MoE.
 type TextMoEBlock struct {
-	GateUp    *nn.LinearBatch `gguf:"ffn_gate_up_exps"`
-	Gate      *nn.LinearBatch `gguf:"ffn_gate_exps"`
-	Up        *nn.LinearBatch `gguf:"ffn_up_exps"`
-	Down      *nn.LinearBatch `gguf:"ffn_down_exps"`
-	DownScale ml.Tensor       `gguf:"ffn_down_exps.scale,alt:ffn_gate_inp.per_expert_scale"`
+	Gate *nn.LinearBatch `gguf:"ffn_gate_exps"`
+	Up   *nn.LinearBatch `gguf:"ffn_up_exps"`
+	Down *nn.LinearBatch `gguf:"ffn_down_exps"`
 }
 
 func (moe *TextMoEBlock) Forward(ctx ml.Context, hiddenState, routingWeights, selectedExperts ml.Tensor, opts *TextOptions) ml.Tensor {
@@ -357,28 +356,10 @@ func (moe *TextMoEBlock) Forward(ctx ml.Context, hiddenState, routingWeights, se
 	hiddenState = hiddenState.Reshape(ctx, hiddenState.Dim(0), 1, hiddenState.Dim(1))
 
 	// Expert computation using LinearBatch (MulmatID selecting experts by index)
-	var gateOut, upOut ml.Tensor
-	if moe.GateUp != nil && moe.GateUp.Weight != nil {
-		gateUp := moe.GateUp.Forward(ctx, hiddenState, selectedExperts)
-		nFF := gateUp.Dim(0) / 2
-		gateOut = gateUp.Slice(ctx, 0, 0, nFF, 1)
-		upOut = gateUp.Slice(ctx, 0, nFF, gateUp.Dim(0), 1)
-	} else {
-		gateOut = moe.Gate.Forward(ctx, hiddenState, selectedExperts)
-		upOut = moe.Up.Forward(ctx, hiddenState, selectedExperts)
-	}
+	gateOut := moe.Gate.Forward(ctx, hiddenState, selectedExperts)
+	upOut := moe.Up.Forward(ctx, hiddenState, selectedExperts)
 	hiddenState = gateOut.GELU(ctx, upOut)
 	experts := moe.Down.Forward(ctx, hiddenState, selectedExperts)
-
-	// Apply per-expert down projection scale when present.
-	if moe.DownScale != nil {
-		expertScales := moe.DownScale.Reshape(ctx, opts.numExperts, 1)
-		expertScales = expertScales.Repeat(ctx, 1, hiddenState.Dim(2))
-		expertScales = expertScales.Reshape(ctx, 1, opts.numExperts, hiddenState.Dim(2)).Rows(ctx, selectedExperts)
-		expertScales = expertScales.Reshape(ctx, opts.numExpertsUsed, hiddenState.Dim(2))
-		expertScales = expertScales.Reshape(ctx, 1, opts.numExpertsUsed, hiddenState.Dim(2))
-		experts = experts.Mul(ctx, expertScales)
-	}
 
 	// Apply routing weights
 	experts = experts.Mul(ctx, routingWeights)
@@ -432,9 +413,7 @@ func (l *TextLayer) Forward(ctx ml.Context, layer int, hiddenState, positions, p
 	residual = hiddenState
 
 	// MLP (+ optional MoE in parallel)
-	hasSplitExperts := l.MoE != nil && l.MoE.Gate != nil && l.MoE.Up != nil && l.MoE.Gate.Weight != nil && l.MoE.Up.Weight != nil
-	hasFusedExperts := l.MoE != nil && l.MoE.GateUp != nil && l.MoE.GateUp.Weight != nil
-	if l.Router != nil && l.MoE != nil && l.MoE.Down != nil && l.MoE.Down.Weight != nil && (hasSplitExperts || hasFusedExperts) {
+	if l.Router != nil && l.MoE != nil && l.MoE.Gate != nil && l.MoE.Gate.Weight != nil {
 		// MoE layers: run MLP and MoE in parallel, sum results
 		mlpState := l.MLPNorm.Forward(ctx, hiddenState, opts.eps)
 		mlpState = l.MLP.Forward(ctx, mlpState)
