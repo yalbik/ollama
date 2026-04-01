@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
-	"regexp"
 	"strings"
 	"unicode"
 
@@ -24,11 +23,6 @@ const (
 	gemma4ThinkingCloseTag = "<channel|>"
 	gemma4ToolCallOpenTag  = "<|tool_call>"
 	gemma4ToolCallCloseTag = "<tool_call|>"
-)
-
-var (
-	gemma4QuotedStringRe = regexp.MustCompile(`(?s)<\|"\|>(.*?)<\|"\|>`)
-	gemma4BareKeyRe      = regexp.MustCompile(`([,{])(\w+):`)
 )
 
 type Gemma4Parser struct {
@@ -350,20 +344,56 @@ func parseGemma4ToolCall(content string) (api.ToolCall, error) {
 }
 
 // gemma4ArgsToJSON converts Gemma 4's custom argument format to valid JSON.
+// The format uses <|"|> for string delimiters and bare identifier keys.
+// Example: {location:<|"|>Paris<|"|>,count:42} → {"location":"Paris","count":42}
 func gemma4ArgsToJSON(s string) string {
-	var quotedStrings []string
-	text := gemma4QuotedStringRe.ReplaceAllStringFunc(s, func(match string) string {
-		submatches := gemma4QuotedStringRe.FindStringSubmatch(match)
-		quotedStrings = append(quotedStrings, submatches[1])
-		return "\x00" + string(rune(len(quotedStrings)-1)) + "\x00"
-	})
+	// Step 1: Replace <|"|> with "
+	s = strings.ReplaceAll(s, `<|"|>`, `"`)
 
-	text = gemma4BareKeyRe.ReplaceAllString(text, `$1"$2":`)
-
-	for i, value := range quotedStrings {
-		escaped, _ := json.Marshal(value)
-		text = strings.ReplaceAll(text, "\x00"+string(rune(i))+"\x00", string(escaped))
+	// Step 2: Quote bare keys (identifiers followed by : that aren't inside strings)
+	var buf strings.Builder
+	buf.Grow(len(s) + 32)
+	inString := false
+	i := 0
+	for i < len(s) {
+		ch := s[i]
+		if ch == '"' && !inString {
+			inString = true
+			buf.WriteByte(ch)
+			i++
+			// Write until closing quote
+			for i < len(s) {
+				buf.WriteByte(s[i])
+				if s[i] == '"' {
+					inString = false
+					i++
+					break
+				}
+				i++
+			}
+			continue
+		}
+		if !inString && isIdentStart(ch) {
+			// Read the full identifier
+			j := i + 1
+			for j < len(s) && isIdentPart(s[j]) {
+				j++
+			}
+			word := s[i:j]
+			if j < len(s) && s[j] == ':' {
+				// It's an object key — quote it
+				buf.WriteByte('"')
+				buf.WriteString(word)
+				buf.WriteByte('"')
+			} else {
+				// It's a bare value (true, false, null, etc.)
+				buf.WriteString(word)
+			}
+			i = j
+		} else {
+			buf.WriteByte(ch)
+			i++
+		}
 	}
-
-	return text
+	return buf.String()
 }
